@@ -44,6 +44,9 @@
 // Matrix-vector multiplication parameters
 #define WEBGPU_MUL_MAT_VEC_WG_SIZE 256
 
+// Subgroup mat-vec parameters
+#define WEBGPU_MUL_MAT_VEC_SUBGROUP_WG_SIZE 128
+
 // Must be multiple of 4 to work with vectorized paths, and must divide
 // mul_mat_vec wg size
 #define WEBGPU_MUL_MAT_VEC_FLOAT_OUTPUTS_PER_WG 64
@@ -592,9 +595,10 @@ struct ggml_webgpu_mul_mat_vec_pipeline_key {
     ggml_type src0_type;
     ggml_type src1_type;
     int       vectorized;
+    int       use_subgroup;
 
     bool operator==(const ggml_webgpu_mul_mat_vec_pipeline_key & other) const {
-        return src0_type == other.src0_type && src1_type == other.src1_type && vectorized == other.vectorized;
+        return src0_type == other.src0_type && src1_type == other.src1_type && vectorized == other.vectorized && use_subgroup == other.use_subgroup;
     }
 };
 
@@ -604,6 +608,7 @@ struct ggml_webgpu_mul_mat_vec_pipeline_key_hash {
         ggml_webgpu_hash_combine(seed, key.src0_type);
         ggml_webgpu_hash_combine(seed, key.src1_type);
         ggml_webgpu_hash_combine(seed, key.vectorized);
+        ggml_webgpu_hash_combine(seed, key.use_subgroup);
         return seed;
     }
 };
@@ -613,6 +618,7 @@ struct ggml_webgpu_mul_mat_vec_shader_decisions {
     uint32_t tile_k;
     uint32_t outputs_per_wg;
     uint32_t vec_size;
+    bool     use_subgroup;
 };
 
 struct ggml_webgpu_mul_mat_pipeline_key {
@@ -1357,6 +1363,23 @@ class ggml_webgpu_shader_lib {
     }
 
     webgpu_pipeline get_mul_mat_vec_pipeline(const ggml_webgpu_shader_lib_context & context) {
+        // Determine if this type should use the subgroup mat-vec shader
+        bool subgroup = false;
+        if (context.supports_subgroup_matrix) {
+            switch (context.src0->type) {
+                case GGML_TYPE_IQ1_S:
+                case GGML_TYPE_IQ1_M:
+                case GGML_TYPE_IQ2_XXS:
+                case GGML_TYPE_IQ2_S:
+                case GGML_TYPE_IQ3_S:
+                case GGML_TYPE_Q4_K:
+                    subgroup = true;
+                    break;
+                default:
+                    break;
+            }
+        }
+
         ggml_webgpu_mul_mat_vec_pipeline_key key = {
             .src0_type  = context.src0->type,
             .src1_type  = context.src1->type,
@@ -1365,6 +1388,7 @@ class ggml_webgpu_shader_lib {
                            (context.src0->type == GGML_TYPE_F32 || context.src0->type == GGML_TYPE_F16)) ?
                               1 :
                               0,
+            .use_subgroup = subgroup ? 1 : 0,
         };
 
         auto it = mul_mat_vec_pipelines.find(key);
@@ -1373,7 +1397,42 @@ class ggml_webgpu_shader_lib {
         }
 
         std::vector<std::string> defines;
-        std::string              variant = "mul_mat_vec";
+        std::string              variant;
+
+        if (key.use_subgroup) {
+            // Subgroup mat-vec: dedicated shader with subgroupAdd reduction
+            const struct ggml_type_traits * src0_traits = ggml_get_type_traits(context.src0->type);
+            const char *                    src0_name   = src0_traits->type_name;
+            std::string                     type_upper  = src0_name;
+            std::transform(type_upper.begin(), type_upper.end(), type_upper.begin(), ::toupper);
+
+            variant = "mul_mat_vec_subgroup_" + std::string(src0_name);
+
+            defines.push_back("BYTE_HELPERS");
+            defines.push_back("U32_DEQUANT_HELPERS");
+            defines.push_back(type_upper + "_GRID");
+            defines.push_back(type_upper + "_TABLES");
+            defines.push_back(type_upper + "_SG");
+
+            uint32_t sg_vec_wg_size = std::min(context.max_wg_size, (uint32_t) WEBGPU_MUL_MAT_VEC_SUBGROUP_WG_SIZE);
+            defines.push_back(std::string("WG_SIZE=") + std::to_string(sg_vec_wg_size));
+
+            auto processed            = preprocessor.preprocess(wgsl_mul_mat_vec_subgroup, defines);
+            auto decisions            = std::make_shared<ggml_webgpu_mul_mat_vec_shader_decisions>();
+            decisions->wg_size        = sg_vec_wg_size;
+            decisions->tile_k         = 0;
+            decisions->outputs_per_wg = 0;
+            decisions->vec_size       = 0;
+            decisions->use_subgroup   = true;
+
+            webgpu_pipeline pipeline   = ggml_webgpu_create_pipeline(device, processed, variant);
+            pipeline.context           = decisions;
+            mul_mat_vec_pipelines[key] = pipeline;
+            return mul_mat_vec_pipelines[key];
+        }
+
+        // Standard mat-vec: shared memory + tree reduction
+        variant = "mul_mat_vec";
 
         // src0 type (matrix row)
         switch (context.src0->type) {
@@ -1443,6 +1502,7 @@ class ggml_webgpu_shader_lib {
         decisions->tile_k         = tile_k;
         decisions->outputs_per_wg = outputs_per_wg;
         decisions->vec_size       = key.vectorized ? 4 : 1;
+        decisions->use_subgroup   = false;
 
         webgpu_pipeline pipeline   = ggml_webgpu_create_pipeline(device, processed, variant);
         pipeline.context           = decisions;

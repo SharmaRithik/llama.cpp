@@ -8032,6 +8032,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, type_b, 16, 1, 256, {1,  1}, {1, 1}));
         }
     }
+
+    // Extended IQ/Q4_K mat-vec (n=1) tests with larger dimensions and multi-block K
+    for (ggml_type type_a : {GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_Q4_K}) {
+        // Large M (output rows)
+        for (int64_t m : {128, 256, 2048}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, 1, 256, {1, 1}, {1, 1}));
+        }
+        // Multi-block K (reduction dimension)
+        for (int64_t k : {512, 1024, 2048, 4096, 8192}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 1, k, {1, 1}, {1, 1}));
+        }
+        // Large M and K combined
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2048, 1, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8192, 1, 2048, {1, 1}, {1, 1}));
+        // Large K with batches
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 1, 2048, {4, 1}, {1, 1}));
+        // Batches with broadcasting
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 1, 256, {3, 2}, {2, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, 1, 256, {3, 2}, {1, 2}));
+    }
 #else
     // m = a rows
     // n = b rows

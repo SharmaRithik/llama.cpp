@@ -1324,10 +1324,21 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context &       ctx,
                     break;
                 case GGML_TYPE_Q2_K:
                 case GGML_TYPE_Q3_K:
-                case GGML_TYPE_Q4_K:
                 case GGML_TYPE_Q5_K:
                     // we don't have fast mat-vec for these types, but we do have (semi) fast mat-mat
                     use_fast = !is_vec;
+                    break;
+                case GGML_TYPE_Q4_K:
+                    // fast mat-mat always; subgroup mat-vec when available
+                    use_fast = !is_vec || ctx->global_ctx->capabilities.supports_subgroup_matrix;
+                    break;
+                case GGML_TYPE_IQ1_S:
+                case GGML_TYPE_IQ1_M:
+                case GGML_TYPE_IQ2_XXS:
+                case GGML_TYPE_IQ2_S:
+                case GGML_TYPE_IQ3_S:
+                    // subgroup mat-vec when available, otherwise legacy
+                    use_fast = is_vec && ctx->global_ctx->capabilities.supports_subgroup_matrix;
                     break;
                 default:
                     break;
@@ -1404,9 +1415,15 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context &       ctx,
     if (use_fast && is_vec) {
         auto * decisions = static_cast<ggml_webgpu_mul_mat_vec_shader_decisions *>(pipeline.context.get());
 
-        uint32_t batches       = dst->ne[2] * dst->ne[3];
-        uint32_t output_groups = CEIL_DIV(dst->ne[0], decisions->outputs_per_wg);
-        uint32_t total_wg      = output_groups * batches;
+        uint32_t batches  = dst->ne[2] * dst->ne[3];
+        uint32_t total_wg;
+        if (decisions->use_subgroup) {
+            uint32_t rows_per_wg = decisions->wg_size / ctx->global_ctx->capabilities.max_subgroup_size;
+            total_wg = CEIL_DIV(dst->ne[0] * batches, rows_per_wg);
+        } else {
+            uint32_t output_groups = CEIL_DIV(dst->ne[0], decisions->outputs_per_wg);
+            total_wg = output_groups * batches;
+        }
         compute_2d_workgroups(total_wg, max_wg_per_dim, wg_x, wg_y);
     } else if (use_fast) {
         auto * decisions = static_cast<ggml_webgpu_mul_mat_shader_decisions *>(pipeline.context.get());

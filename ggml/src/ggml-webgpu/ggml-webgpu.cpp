@@ -1234,7 +1234,7 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
             use_fast = (src0->type == GGML_TYPE_F16);
             break;
         case GGML_TYPE_F32:
-            // TODO: implement better mat-mat for k-quants, mat-vec for all k-quants except q6_K
+            // TODO: implement better mat-mat for k-quants, mat-vec for all k-quants except q6_K, and fast mat-mat for i-quants
             switch (src0->type) {
                 case GGML_TYPE_F32:
                 case GGML_TYPE_F16:
@@ -1250,6 +1250,18 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
                 case GGML_TYPE_Q3_K:
                 case GGML_TYPE_Q2_K:
                     use_fast = true;
+                    break;
+                case GGML_TYPE_IQ1_S:
+                case GGML_TYPE_IQ1_M:
+                case GGML_TYPE_IQ2_XXS:
+                case GGML_TYPE_IQ2_XS:
+                case GGML_TYPE_IQ2_S:
+                case GGML_TYPE_IQ3_XXS:
+                case GGML_TYPE_IQ3_S:
+                case GGML_TYPE_IQ4_NL:
+                case GGML_TYPE_IQ4_XS:
+                    // i-quants: fast mat-vec only; mat-mat falls back to legacy
+                    use_fast = is_vec;
                     break;
                 default:
                     break;

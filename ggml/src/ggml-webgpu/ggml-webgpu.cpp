@@ -1049,6 +1049,77 @@ static webgpu_encoded_op ggml_webgpu_ssm_conv(webgpu_context & ctx,
     return ggml_backend_webgpu_build(ctx, pipeline, params, entries, wg_x, wg_y);
 }
 
+static webgpu_encoded_op ggml_webgpu_ssm_scan(webgpu_context & ctx,
+                                              ggml_tensor *    s,    // src0
+                                              ggml_tensor *    x,    // src1
+                                              ggml_tensor *    dt,   // src2
+                                              ggml_tensor *    A,    // src3
+                                              ggml_tensor *    B,    // src4
+                                              ggml_tensor *    C,    // src5
+                                              ggml_tensor *    ids,  // src6
+                                              ggml_tensor *    dst) {
+    ggml_webgpu_shader_lib_context shader_lib_ctx = {};
+    shader_lib_ctx.src0                           = s;
+    shader_lib_ctx.src1                           = x;
+    shader_lib_ctx.src2                           = dt;
+    shader_lib_ctx.src3                           = A;
+    shader_lib_ctx.src4                           = B;
+    shader_lib_ctx.dst                            = dst;
+    shader_lib_ctx.max_wg_size        = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
+    shader_lib_ctx.supports_subgroups = ctx->global_ctx->capabilities.supports_subgroups;
+
+    webgpu_pipeline pipeline = ctx->shader_lib->get_ssm_scan_pipeline(shader_lib_ctx);
+
+    const uint32_t nc = (uint32_t) s->ne[0];
+    const uint32_t nr = (uint32_t) s->ne[1];
+    const uint32_t nh = (uint32_t) x->ne[1];
+    const uint32_t ng = (uint32_t) B->ne[1];
+    const uint32_t nt = (uint32_t) x->ne[2];
+    const uint32_t ns = (uint32_t) x->ne[3];
+
+    // Mamba-2 uses a per-head scalar A (A.ne[0] == 1); Mamba-1 uses a per-state-lane A.
+    const uint32_t is_mamba2 = (A->ne[0] == 1) ? 1u : 0u;
+    // dst is laid out as [y | s_out]; s_off is the offset to s_out, in f32 elements.
+    const uint32_t s_off = (uint32_t) ggml_nelements(x);
+
+    std::vector<uint32_t> params = {
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, s)   / ggml_type_size(s->type)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, x)   / ggml_type_size(x->type)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dt)  / ggml_type_size(dt->type)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, A)   / ggml_type_size(A->type)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, B)   / ggml_type_size(B->type)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, C)   / ggml_type_size(C->type)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, ids) / ggml_type_size(ids->type)),
+        (uint32_t) (ggml_webgpu_tensor_misalignment(ctx, dst) / ggml_type_size(dst->type)),
+
+        nc, nr, nh, ng, nt, ns,
+
+        (uint32_t) (s->nb[3]  / ggml_type_size(s->type)),
+        (uint32_t) (x->nb[2]  / ggml_type_size(x->type)),
+        (uint32_t) (x->nb[3]  / ggml_type_size(x->type)),
+        (uint32_t) (dt->nb[1] / ggml_type_size(dt->type)),
+        (uint32_t) (dt->nb[2] / ggml_type_size(dt->type)),
+        (uint32_t) (B->nb[2]  / ggml_type_size(B->type)),
+        (uint32_t) (B->nb[3]  / ggml_type_size(B->type)),
+
+        is_mamba2,
+        s_off,
+    };
+
+    std::vector<wgpu::BindGroupEntry> entries = {
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 0, s),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 1, x),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 2, dt),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 3, A),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 4, B),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 5, C),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 6, ids),
+        ggml_webgpu_make_tensor_bind_group_entry(ctx, 7, dst),
+    };
+
+    return ggml_backend_webgpu_build(ctx, pipeline, params, entries, nr * nh, ns);
+}
+
 static webgpu_encoded_op ggml_webgpu_gated_delta_net(webgpu_context & ctx,
                                                      ggml_tensor *    src0,
                                                      ggml_tensor *    src1,
@@ -2544,6 +2615,9 @@ static std::optional<webgpu_encoded_op> ggml_webgpu_encode_node(webgpu_context c
             return ggml_webgpu_solve_tri(ctx, src0, src1, node);
         case GGML_OP_SSM_CONV:
             return ggml_webgpu_ssm_conv(ctx, src0, src1, node);
+        case GGML_OP_SSM_SCAN:
+            return ggml_webgpu_ssm_scan(ctx, src0, src1, src2,
+                                        node->src[3], node->src[4], node->src[5], node->src[6], node);
         case GGML_OP_GATED_DELTA_NET:
             return ggml_webgpu_gated_delta_net(ctx, src0, src1, src2, node->src[3], node->src[4], node->src[5], node);
         case GGML_OP_PAD:
@@ -3586,6 +3660,13 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
             break;
         case GGML_OP_SSM_CONV:
             supports_op = op->type == GGML_TYPE_F32;
+            break;
+        case GGML_OP_SSM_SCAN:
+            supports_op = op->type == GGML_TYPE_F32 &&
+                          src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                          src2->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                          op->src[4]->type == GGML_TYPE_F32 && op->src[5]->type == GGML_TYPE_F32 &&
+                          op->src[6]->type == GGML_TYPE_I32;
             break;
         case GGML_OP_GATED_DELTA_NET:
             {

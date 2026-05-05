@@ -157,3 +157,13 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# WebGPU bounds-check experiment artifacts (raw outputs may contain
+# absolute filesystem paths from the runner's machine — keep local).
+/arc-bench-bounds-*.json
+/arc-bench-stderr.log
+/perf-bounds-*.sql
+/llama-bench-bounds-*.json
+/llama-bench-stderr.log
+/experiment-results.md
+/llama-bench-results.md

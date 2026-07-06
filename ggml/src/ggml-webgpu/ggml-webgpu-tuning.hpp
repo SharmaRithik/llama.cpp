@@ -65,6 +65,13 @@ enum class ggml_webgpu_device : uint32_t {
     apple,
 };
 
+// GPU architecture, the practical granularity for kernel tuning. Only values
+// confirmed from a real adapter are listed; anything else classifies generic.
+enum class ggml_webgpu_arch : uint32_t {
+    generic = 0,
+    nvidia_blackwell,
+};
+
 enum class ggml_webgpu_model : uint32_t {
     generic = 0,
     llama_3_2_1b,
@@ -92,6 +99,18 @@ inline ggml_webgpu_size_class ggml_webgpu_classify_size(uint32_t n_tokens) {
     return ggml_webgpu_size_class::prefill_large;
 }
 
+inline const char * ggml_webgpu_size_class_name(ggml_webgpu_size_class sc) {
+    switch (sc) {
+        case ggml_webgpu_size_class::decode:
+            return "decode";
+        case ggml_webgpu_size_class::prefill_small:
+            return "prefill_small";
+        case ggml_webgpu_size_class::prefill_large:
+            return "prefill_large";
+    }
+    return "unknown";
+}
+
 // What the backend observes at pipeline-creation time. Strings are mapped to
 // the enum axes inside the lookup.
 struct ggml_webgpu_tuning_selector {
@@ -101,6 +120,13 @@ struct ggml_webgpu_tuning_selector {
     std::string            model;       // e.g. "llama-3.2-1b"
     ggml_webgpu_size_class size_class = ggml_webgpu_size_class::decode;
 };
+
+// Human-readable pipeline-name suffix so tuned profiles are distinguishable in
+// GPU traces. The pipeline cache key uses the knob id; this is only the label.
+inline std::string ggml_webgpu_tuning_variant_suffix(const ggml_webgpu_tuning_selector & sel) {
+    const std::string model = sel.model.empty() ? "generic" : sel.model;
+    return "_" + model + "_" + ggml_webgpu_size_class_name(sel.size_class);
+}
 
 // ============================================================================
 // Axis classification (string / shape -> enum), all table-driven
@@ -153,6 +179,21 @@ inline ggml_webgpu_device ggml_webgpu_classify_device(const std::string & vendor
     return ggml_webgpu_device::generic;
 }
 
+inline ggml_webgpu_arch ggml_webgpu_classify_arch(const std::string & arch) {
+    static const struct {
+        const char *     name;
+        ggml_webgpu_arch arch;
+    } table[] = {
+        { "blackwell", ggml_webgpu_arch::nvidia_blackwell },
+    };
+    for (const auto & e : table) {
+        if (arch == e.name) {
+            return e.arch;
+        }
+    }
+    return ggml_webgpu_arch::generic;
+}
+
 inline ggml_webgpu_model ggml_webgpu_model_from_name(const std::string & name) {
     for (const auto & e : GGML_WEBGPU_MODEL_NAMES) {
         if (name == e.name) {
@@ -186,25 +227,27 @@ inline ggml_webgpu_model ggml_webgpu_model_from_shape(uint32_t n_embd, uint32_t 
 
 struct ggml_webgpu_tuning_key {
     ggml_webgpu_device     device;
+    ggml_webgpu_arch       arch;
     ggml_webgpu_model      model;
     ggml_webgpu_size_class size_class;
 
     bool operator==(const ggml_webgpu_tuning_key & o) const {
-        return device == o.device && model == o.model && size_class == o.size_class;
+        return device == o.device && arch == o.arch && model == o.model && size_class == o.size_class;
     }
 };
 
 struct ggml_webgpu_tuning_key_hash {
     size_t operator()(const ggml_webgpu_tuning_key & k) const {
-        return ((size_t) k.device << 16) ^ ((size_t) k.model << 8) ^ (size_t) k.size_class;
+        return ((size_t) k.device << 24) ^ ((size_t) k.arch << 16) ^ ((size_t) k.model << 8) ^ (size_t) k.size_class;
     }
 };
 
 // Overrides only. Anything absent falls back to the struct defaults, so these
 // empty maps mean "baseline everywhere". Add rows as real per
-// (device, model, size class) sweep data becomes available, e.g.:
-//   { { ggml_webgpu_device::nvidia, ggml_webgpu_model::llama_3_2_1b,
-//       ggml_webgpu_size_class::prefill_large }, { /*tile_m*/ 8, /*tile_n*/ 8 } },
+// (device, arch, model, size class) sweep data becomes available, e.g.:
+//   { { ggml_webgpu_device::nvidia, ggml_webgpu_arch::nvidia_blackwell,
+//       ggml_webgpu_model::llama_3_2_1b, ggml_webgpu_size_class::prefill_large },
+//     { /*tile_m*/ 8, /*tile_n*/ 8 } },
 static const std::unordered_map<ggml_webgpu_tuning_key, ggml_webgpu_mul_mat_knobs, ggml_webgpu_tuning_key_hash>
     GGML_WEBGPU_MUL_MAT_TUNING = {};
 
@@ -221,12 +264,15 @@ static const std::unordered_map<ggml_webgpu_tuning_key, ggml_webgpu_mul_mat_vec_
 template <typename Knobs, typename Map>
 inline Knobs ggml_webgpu_tuning_lookup(const Map & table, const ggml_webgpu_tuning_selector & sel) {
     const ggml_webgpu_device device = ggml_webgpu_classify_device(sel.vendor, sel.device);
+    const ggml_webgpu_arch   arch   = ggml_webgpu_classify_arch(sel.arch);
     const ggml_webgpu_model  model  = ggml_webgpu_model_from_name(sel.model);
 
+    // Most specific first, wildcarding model, then arch, then device.
     const ggml_webgpu_tuning_key candidates[] = {
-        { device,                      model,                      sel.size_class },
-        { device,                      ggml_webgpu_model::generic, sel.size_class },
-        { ggml_webgpu_device::generic, ggml_webgpu_model::generic, sel.size_class },
+        { device,                      arch,                      model,                      sel.size_class },
+        { device,                      arch,                      ggml_webgpu_model::generic, sel.size_class },
+        { device,                      ggml_webgpu_arch::generic, ggml_webgpu_model::generic, sel.size_class },
+        { ggml_webgpu_device::generic, ggml_webgpu_arch::generic, ggml_webgpu_model::generic, sel.size_class },
     };
     for (const auto & key : candidates) {
         auto it = table.find(key);

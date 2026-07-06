@@ -2005,6 +2005,8 @@ class ggml_webgpu_shader_lib {
         decisions->outputs_per_wg = outputs_per_wg;
         decisions->vec_size       = key.vectorized ? 4 : 1;
 
+        variant += ggml_webgpu_tuning_variant_suffix(sel);
+
         webgpu_pipeline pipeline   = ggml_webgpu_create_pipeline(device, processed, variant);
         pipeline.context           = decisions;
         mul_mat_vec_pipelines[key] = pipeline;
@@ -2168,6 +2170,8 @@ class ggml_webgpu_shader_lib {
             decisions->mul_mat_wg_size = knobs.wg_size;
         }
 
+        variant += ggml_webgpu_tuning_variant_suffix(sel);
+
         webgpu_pipeline pipeline    = ggml_webgpu_create_pipeline(device, processed, variant);
         pipeline.context            = decisions;
         mul_mat_fast_pipelines[key] = pipeline;
@@ -2202,8 +2206,9 @@ class ggml_webgpu_shader_lib {
                              1 :
                              0;
 
+        // MUL_MAT_ID keeps the token count in dst->ne[2] (ne[1] is n_expert_used).
         ggml_webgpu_tuning_selector sel = { context.vendor, context.arch, context.device, context.model,
-                                            ggml_webgpu_classify_size((uint32_t) context.dst->ne[1]) };
+                                            ggml_webgpu_classify_size((uint32_t) context.dst->ne[2]) };
         ggml_webgpu_mul_mat_knobs knobs = ggml_webgpu_lookup_mul_mat(sel);
         key.tuning_id                   = ggml_webgpu_knobs_id(knobs);
 
@@ -2314,6 +2319,8 @@ class ggml_webgpu_shader_lib {
         decisions->wg_size_n = knobs.wg_size_n;
         decisions->wg_size   = knobs.wg_size_m * knobs.wg_size_n;
 
+        variant += ggml_webgpu_tuning_variant_suffix(sel);
+
         webgpu_pipeline pipeline  = ggml_webgpu_create_pipeline(device, processed, variant);
         pipeline.context          = decisions;
         mul_mat_id_pipelines[key] = pipeline;
@@ -2330,8 +2337,9 @@ class ggml_webgpu_shader_lib {
                              1 :
                              0;
 
+        // MUL_MAT_ID keeps the token count in dst->ne[2] (ne[1] is n_expert_used).
         ggml_webgpu_tuning_selector sel = { context.vendor, context.arch, context.device, context.model,
-                                            ggml_webgpu_classify_size((uint32_t) context.dst->ne[1]) };
+                                            ggml_webgpu_classify_size((uint32_t) context.dst->ne[2]) };
         ggml_webgpu_mul_mat_vec_knobs knobs = ggml_webgpu_lookup_mul_mat_vec(sel);
         key.tuning_id                       = ggml_webgpu_knobs_id(knobs);
 
@@ -2439,6 +2447,8 @@ class ggml_webgpu_shader_lib {
         auto decisions            = std::make_shared<ggml_webgpu_mul_mat_vec_shader_decisions>();
         decisions->wg_size        = wg_size;
         decisions->outputs_per_wg = outputs_per_wg;
+
+        variant += ggml_webgpu_tuning_variant_suffix(sel);
 
         webgpu_pipeline pipeline      = ggml_webgpu_create_pipeline(device, processed, variant);
         pipeline.context              = decisions;

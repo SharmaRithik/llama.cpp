@@ -5,13 +5,14 @@
 //
 // Central place for the compile-time shader knobs (workgroup sizes, tile
 // sizes, outputs-per-workgroup, subgroup-matrix layout) used by the matmul
-// family of kernels. The values are selected per device, per size class and
-// per model, so a single build can carry tuned parameters for many targets.
+// family of kernels. Knobs are selected on three axes -- device, size class
+// and model -- each an enum, and looked up in a hash map of overrides.
 //
-// Selection is a most-specific-match lookup over a static table with a safe
-// fallback: an unmatched selector returns the generic defaults, which are the
-// values the backend shipped with, so behavior is unchanged unless a tuned
-// entry applies.
+// A lookup builds the most-specific key and falls back through less-specific
+// keys in a fixed order; anything not present in the map uses the compiled-in
+// struct defaults, which are the values the backend shipped with. An empty
+// map therefore means "baseline everywhere" and adding a row is how a target
+// gets tuned.
 
 #include "ggml-impl.h"
 #include "ggml.h"
@@ -19,13 +20,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Knobs
-// ---------------------------------------------------------------------------
+// ============================================================================
 
-// Register-tile / subgroup-matrix matmul (prefill) knobs. Default values are
-// the backend baseline and act as the generic profile.
+// Register-tile / subgroup-matrix matmul (prefill) knobs. Defaults are the
+// backend baseline and act as the generic profile.
 struct ggml_webgpu_mul_mat_knobs {
     uint32_t tile_m                = 4;
     uint32_t tile_n                = 4;
@@ -50,166 +52,206 @@ struct ggml_webgpu_mul_mat_vec_knobs {
     uint32_t k_q_outputs_per_wg      = 4;
 };
 
-// ---------------------------------------------------------------------------
-// Selector
-// ---------------------------------------------------------------------------
+// ============================================================================
+// Selection axes
+// ============================================================================
 
-// Problem size class, derived from the number of columns (tokens) of the
-// matmul destination. Decode uses the mat-vec kernels, prefill the reg-tile /
-// subgroup-matrix kernels; prefill is split so wide GEMMs can differ from
-// short ones.
-enum ggml_webgpu_size_class {
-    GGML_WEBGPU_SIZE_DECODE = 0,     // N <= 4
-    GGML_WEBGPU_SIZE_PREFILL_SMALL,  // 4 < N <= 128
-    GGML_WEBGPU_SIZE_PREFILL_LARGE,  // N > 128
+// `generic` is the wildcard / fallback value on each axis.
+enum class ggml_webgpu_device : uint32_t {
+    generic = 0,
+    nvidia,
+    intel,
+    amd,
+    apple,
+};
+
+enum class ggml_webgpu_model : uint32_t {
+    generic = 0,
+    llama_3_2_1b,
+    gemma_3_270m,
+    gemma_3_1b,
+    qwen3_0_6b,
+};
+
+// Problem size, from the number of columns (tokens) of the matmul output.
+// Decode uses the mat-vec kernels, prefill the reg-tile / subgroup-matrix
+// kernels; prefill is split so wide GEMMs can differ from short ones.
+enum class ggml_webgpu_size_class : uint32_t {
+    decode = 0,     // N <= 4
+    prefill_small,  // 4 < N <= 128
+    prefill_large,  // N > 128
 };
 
 inline ggml_webgpu_size_class ggml_webgpu_classify_size(uint32_t n_tokens) {
     if (n_tokens <= 4) {
-        return GGML_WEBGPU_SIZE_DECODE;
+        return ggml_webgpu_size_class::decode;
     }
     if (n_tokens <= 128) {
-        return GGML_WEBGPU_SIZE_PREFILL_SMALL;
+        return ggml_webgpu_size_class::prefill_small;
     }
-    return GGML_WEBGPU_SIZE_PREFILL_LARGE;
+    return ggml_webgpu_size_class::prefill_large;
 }
 
-inline const char * ggml_webgpu_size_class_name(ggml_webgpu_size_class sc) {
-    switch (sc) {
-        case GGML_WEBGPU_SIZE_DECODE:
-            return "decode";
-        case GGML_WEBGPU_SIZE_PREFILL_SMALL:
-            return "prefill_small";
-        case GGML_WEBGPU_SIZE_PREFILL_LARGE:
-            return "prefill_large";
-    }
-    return "unknown";
-}
-
-// Everything the backend can observe about the target, collapsed into the
-// keys the library selects on.
+// What the backend observes at pipeline-creation time. Strings are mapped to
+// the enum axes inside the lookup.
 struct ggml_webgpu_tuning_selector {
     std::string            vendor;      // e.g. "nvidia"
     std::string            arch;        // e.g. "blackwell"
     std::string            device;      // e.g. "NVIDIA GeForce RTX 5080"
-    std::string            model;       // e.g. "llama-3.2-1b" or a shape signature
-    ggml_webgpu_size_class size_class = GGML_WEBGPU_SIZE_DECODE;
+    std::string            model;       // e.g. "llama-3.2-1b"
+    ggml_webgpu_size_class size_class = ggml_webgpu_size_class::decode;
 };
 
-// ---------------------------------------------------------------------------
-// Tuning database
-// ---------------------------------------------------------------------------
+// ============================================================================
+// Axis classification (string / shape -> enum), all table-driven
+// ============================================================================
 
-// One row of the database. An empty ("") match string is a wildcard; a
-// size_class of -1 matches any size. `device` matches as a substring of the
-// selector device name so a family ("RTX 50") can cover several cards.
-struct ggml_webgpu_mul_mat_row {
-    const char *              vendor;
-    const char *              device;
-    const char *              model;
-    int                       size_class;
-    ggml_webgpu_mul_mat_knobs knobs;
+// Single source of truth for model <-> canonical name.
+struct ggml_webgpu_model_name_row {
+    ggml_webgpu_model model;
+    const char *      name;
 };
 
-struct ggml_webgpu_mul_mat_vec_row {
-    const char *                  vendor;
-    const char *                  device;
-    const char *                  model;
-    int                           size_class;
-    ggml_webgpu_mul_mat_vec_knobs knobs;
+static const ggml_webgpu_model_name_row GGML_WEBGPU_MODEL_NAMES[] = {
+    { ggml_webgpu_model::llama_3_2_1b, "llama-3.2-1b" },
+    { ggml_webgpu_model::gemma_3_270m, "gemma-3-270m" },
+    { ggml_webgpu_model::gemma_3_1b,   "gemma-3-1b"   },
+    { ggml_webgpu_model::qwen3_0_6b,   "qwen3-0.6b"   },
 };
 
-// NVIDIA profile. Values below are the current baseline seeds; refine per
-// (device, size class, model) as benchmark data becomes available. Rows are
-// scanned top to bottom and the most specific match wins, so order does not
-// matter for correctness, only wildcards vs. concrete fields.
-static const ggml_webgpu_mul_mat_row GGML_WEBGPU_MUL_MAT_TABLE[] = {
-    // vendor    device  model  size_class                       knobs
-    { "nvidia",  "",     "",    GGML_WEBGPU_SIZE_PREFILL_SMALL,  {} },
-    { "nvidia",  "",     "",    GGML_WEBGPU_SIZE_PREFILL_LARGE,  {} },
+// Known model shape signatures. n_embd is the primary discriminator; n_vocab
+// disambiguates families that share a hidden size.
+struct ggml_webgpu_model_shape_row {
+    ggml_webgpu_model model;
+    uint32_t          n_embd;
+    uint32_t          n_vocab_min;
 };
 
-static const ggml_webgpu_mul_mat_vec_row GGML_WEBGPU_MUL_MAT_VEC_TABLE[] = {
-    // vendor    device  model  size_class               knobs
-    { "nvidia",  "",     "",    GGML_WEBGPU_SIZE_DECODE, {} },
+static const ggml_webgpu_model_shape_row GGML_WEBGPU_MODEL_SHAPES[] = {
+    { ggml_webgpu_model::llama_3_2_1b, 2048, 128000 },
+    { ggml_webgpu_model::gemma_3_270m, 640,  0      },
+    { ggml_webgpu_model::gemma_3_1b,   1152, 0      },
+    { ggml_webgpu_model::qwen3_0_6b,   1024, 150000 },
 };
 
-// ---------------------------------------------------------------------------
-// Lookup
-// ---------------------------------------------------------------------------
-
-namespace ggml_webgpu_tuning_detail {
-
-// Returns -1 if the row does not match, otherwise a specificity score (higher
-// is more specific) so the best match can be picked.
-inline int match_score(const char *                        row_vendor,
-                       const char *                        row_device,
-                       const char *                        row_model,
-                       int                                 row_size_class,
-                       const ggml_webgpu_tuning_selector & sel) {
-    int score = 0;
-    if (row_vendor[0]) {
-        if (sel.vendor != row_vendor) {
-            return -1;
+inline ggml_webgpu_device ggml_webgpu_classify_device(const std::string & vendor, const std::string & name) {
+    GGML_UNUSED(name);  // reserved for finer per-GPU tuning (e.g. by device name)
+    static const struct {
+        const char *       vendor;
+        ggml_webgpu_device device;
+    } table[] = {
+        { "nvidia", ggml_webgpu_device::nvidia },
+        { "intel",  ggml_webgpu_device::intel  },
+        { "amd",    ggml_webgpu_device::amd    },
+        { "apple",  ggml_webgpu_device::apple  },
+    };
+    for (const auto & e : table) {
+        if (vendor == e.vendor) {
+            return e.device;
         }
-        score += 1;
     }
-    if (row_device[0]) {
-        if (sel.device.find(row_device) == std::string::npos) {
-            return -1;
-        }
-        score += 2;
-    }
-    if (row_model[0]) {
-        if (sel.model != row_model) {
-            return -1;
-        }
-        score += 4;
-    }
-    if (row_size_class >= 0) {
-        if ((int) sel.size_class != row_size_class) {
-            return -1;
-        }
-        score += 1;
-    }
-    return score;
+    return ggml_webgpu_device::generic;
 }
 
-}  // namespace ggml_webgpu_tuning_detail
-
-inline ggml_webgpu_mul_mat_knobs ggml_webgpu_lookup_mul_mat(const ggml_webgpu_tuning_selector & sel) {
-    ggml_webgpu_mul_mat_knobs best = {};  // generic default
-    int                       best_score = -1;
-    for (const auto & row : GGML_WEBGPU_MUL_MAT_TABLE) {
-        int s = ggml_webgpu_tuning_detail::match_score(row.vendor, row.device, row.model, row.size_class, sel);
-        if (s > best_score) {
-            best_score = s;
-            best       = row.knobs;
+inline ggml_webgpu_model ggml_webgpu_model_from_name(const std::string & name) {
+    for (const auto & e : GGML_WEBGPU_MODEL_NAMES) {
+        if (name == e.name) {
+            return e.model;
         }
     }
-    return best;
+    return ggml_webgpu_model::generic;
+}
+
+inline const char * ggml_webgpu_model_to_name(ggml_webgpu_model model) {
+    for (const auto & e : GGML_WEBGPU_MODEL_NAMES) {
+        if (model == e.model) {
+            return e.name;
+        }
+    }
+    return "generic";
+}
+
+inline ggml_webgpu_model ggml_webgpu_model_from_shape(uint32_t n_embd, uint32_t n_vocab) {
+    for (const auto & s : GGML_WEBGPU_MODEL_SHAPES) {
+        if (n_embd == s.n_embd && n_vocab >= s.n_vocab_min) {
+            return s.model;
+        }
+    }
+    return ggml_webgpu_model::generic;
+}
+
+// ============================================================================
+// Tuning registry (map of overrides, keyed by the three axes)
+// ============================================================================
+
+struct ggml_webgpu_tuning_key {
+    ggml_webgpu_device     device;
+    ggml_webgpu_model      model;
+    ggml_webgpu_size_class size_class;
+
+    bool operator==(const ggml_webgpu_tuning_key & o) const {
+        return device == o.device && model == o.model && size_class == o.size_class;
+    }
+};
+
+struct ggml_webgpu_tuning_key_hash {
+    size_t operator()(const ggml_webgpu_tuning_key & k) const {
+        return ((size_t) k.device << 16) ^ ((size_t) k.model << 8) ^ (size_t) k.size_class;
+    }
+};
+
+// Overrides only. Anything absent falls back to the struct defaults, so these
+// empty maps mean "baseline everywhere". Add rows as real per
+// (device, model, size class) sweep data becomes available, e.g.:
+//   { { ggml_webgpu_device::nvidia, ggml_webgpu_model::llama_3_2_1b,
+//       ggml_webgpu_size_class::prefill_large }, { /*tile_m*/ 8, /*tile_n*/ 8 } },
+static const std::unordered_map<ggml_webgpu_tuning_key, ggml_webgpu_mul_mat_knobs, ggml_webgpu_tuning_key_hash>
+    GGML_WEBGPU_MUL_MAT_TUNING = {};
+
+static const std::unordered_map<ggml_webgpu_tuning_key, ggml_webgpu_mul_mat_vec_knobs, ggml_webgpu_tuning_key_hash>
+    GGML_WEBGPU_MUL_MAT_VEC_TUNING = {};
+
+// ============================================================================
+// Lookup
+// ============================================================================
+
+// Try the map from most- to least-specific key, then the compiled-in default.
+// `generic` on an axis is the wildcard, so the fallback order is:
+//   (device, model, size) -> (device, generic, size) -> (generic, generic, size).
+template <typename Knobs, typename Map>
+inline Knobs ggml_webgpu_tuning_lookup(const Map & table, const ggml_webgpu_tuning_selector & sel) {
+    const ggml_webgpu_device device = ggml_webgpu_classify_device(sel.vendor, sel.device);
+    const ggml_webgpu_model  model  = ggml_webgpu_model_from_name(sel.model);
+
+    const ggml_webgpu_tuning_key candidates[] = {
+        { device,                      model,                      sel.size_class },
+        { device,                      ggml_webgpu_model::generic, sel.size_class },
+        { ggml_webgpu_device::generic, ggml_webgpu_model::generic, sel.size_class },
+    };
+    for (const auto & key : candidates) {
+        auto it = table.find(key);
+        if (it != table.end()) {
+            return it->second;
+        }
+    }
+    return {};  // compiled-in defaults
+}
+
+inline ggml_webgpu_mul_mat_knobs ggml_webgpu_lookup_mul_mat(const ggml_webgpu_tuning_selector & sel) {
+    return ggml_webgpu_tuning_lookup<ggml_webgpu_mul_mat_knobs>(GGML_WEBGPU_MUL_MAT_TUNING, sel);
 }
 
 inline ggml_webgpu_mul_mat_vec_knobs ggml_webgpu_lookup_mul_mat_vec(const ggml_webgpu_tuning_selector & sel) {
-    ggml_webgpu_mul_mat_vec_knobs best = {};  // generic default
-    int                           best_score = -1;
-    for (const auto & row : GGML_WEBGPU_MUL_MAT_VEC_TABLE) {
-        int s = ggml_webgpu_tuning_detail::match_score(row.vendor, row.device, row.model, row.size_class, sel);
-        if (s > best_score) {
-            best_score = s;
-            best       = row.knobs;
-        }
-    }
-    return best;
+    return ggml_webgpu_tuning_lookup<ggml_webgpu_mul_mat_vec_knobs>(GGML_WEBGPU_MUL_MAT_VEC_TUNING, sel);
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Stable ids
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 // FNV-1a over the resolved knob values. Used to key the pipeline cache so that
 // distinct knob sets compile distinct pipelines, while identical knobs share
-// one. Two selectors that resolve to the same knobs collapse to one pipeline.
+// one.
 inline uint32_t ggml_webgpu_knobs_hash(const uint32_t * words, size_t count) {
     uint32_t h = 2166136261u;
     for (size_t i = 0; i < count; i++) {
@@ -235,15 +277,15 @@ inline uint32_t ggml_webgpu_knobs_id(const ggml_webgpu_mul_mat_vec_knobs & k) {
     return ggml_webgpu_knobs_hash(words, sizeof(words) / sizeof(words[0]));
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Model identification
-// ---------------------------------------------------------------------------
+// ============================================================================
 
-// Best-effort model fingerprint from a compute graph. The backend never sees
-// the model name, so it is inferred from the matmul shapes: n_embd is the most
+// Best-effort model name from a compute graph. The backend never sees the
+// model name, so it is inferred from the matmul shapes: n_embd is the most
 // common reduction dim, n_vocab the largest output dim. Known signatures map
-// to friendly names; anything else returns a compact signature so it is still
-// a stable, distinct key. An env override wins over inference.
+// to a canonical name; anything else returns a compact signature so it is
+// still a stable, distinct key. An env override wins over inference.
 inline std::string ggml_webgpu_resolve_model_id(const ggml_cgraph * cgraph, const std::string & vendor) {
     if (const char * env = std::getenv("GGML_WEBGPU_TUNING_MODEL")) {
         if (env[0]) {
@@ -252,12 +294,9 @@ inline std::string ggml_webgpu_resolve_model_id(const ggml_cgraph * cgraph, cons
     }
     GGML_UNUSED(vendor);
 
-    // Collect matmul reduction dims (K) and output dims (M).
-    uint32_t n_embd  = 0;  // most frequent K
-    uint32_t n_ff    = 0;  // largest K seen (ffn projections)
-    uint32_t n_vocab = 0;  // largest M seen (output projection)
+    uint32_t n_vocab = 0;  // largest output dim (M)
 
-    // Track the most frequent K with a tiny frequency table.
+    // Most-frequent reduction dim (K) via a small frequency table.
     uint32_t k_vals[16]  = {};
     uint32_t k_count[16] = {};
     int      n_k         = 0;
@@ -273,9 +312,6 @@ inline std::string ggml_webgpu_resolve_model_id(const ggml_cgraph * cgraph, cons
         }
         const uint32_t k = (uint32_t) w->ne[0];
         const uint32_t m = (uint32_t) w->ne[1];
-        if (k > n_ff) {
-            n_ff = k;
-        }
         if (m > n_vocab) {
             n_vocab = m;
         }
@@ -296,6 +332,7 @@ inline std::string ggml_webgpu_resolve_model_id(const ggml_cgraph * cgraph, cons
         }
     }
 
+    uint32_t n_embd     = 0;
     uint32_t best_count = 0;
     for (int j = 0; j < n_k; j++) {
         if (k_count[j] > best_count) {
@@ -308,21 +345,11 @@ inline std::string ggml_webgpu_resolve_model_id(const ggml_cgraph * cgraph, cons
         return "generic";
     }
 
-    // Known small models (n_embd is the primary discriminator).
-    if (n_embd == 2048 && n_vocab >= 128000) {
-        return "llama-3.2-1b";
+    const ggml_webgpu_model model = ggml_webgpu_model_from_shape(n_embd, n_vocab);
+    if (model != ggml_webgpu_model::generic) {
+        return ggml_webgpu_model_to_name(model);
     }
-    if (n_embd == 640) {
-        return "gemma-3-270m";
-    }
-    if (n_embd == 1152) {
-        return "gemma-3-1b";
-    }
-    if (n_embd == 1024 && n_vocab >= 150000) {
-        return "qwen3-0.6b";
-    }
-
-    return std::string("e") + std::to_string(n_embd) + "_f" + std::to_string(n_ff) + "_v" + std::to_string(n_vocab);
+    return std::string("e") + std::to_string(n_embd) + "_v" + std::to_string(n_vocab);
 }
 
 #endif  // GGML_WEBGPU_TUNING_HPP

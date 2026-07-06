@@ -8,6 +8,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml-webgpu-shader-lib.hpp"
+#include "ggml-webgpu-tuning.hpp"
 #include "ggml.h"
 
 #ifdef __EMSCRIPTEN__
@@ -18,6 +19,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #ifdef GGML_WEBGPU_GPU_PROFILE
 #    include <iomanip>
@@ -204,6 +206,9 @@ struct webgpu_global_context_struct {
     webgpu_pipeline memset_pipeline;
 
     std::string vendor;
+    std::string arch;
+    std::string device_name;
+    std::string model_id;
 
     // TODO: We should rework the CPU profiling time handling to make it more useful. ref: https://github.com/ggml-org/llama.cpp/pull/22050
 #ifdef GGML_WEBGPU_CPU_PROFILE
@@ -1479,6 +1484,9 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
     shader_lib_ctx.max_subgroup_size        = ctx->global_ctx->capabilities.max_subgroup_size;
     shader_lib_ctx.supports_dot_product     = ctx->global_ctx->capabilities.supports_dot_product;
     shader_lib_ctx.vendor                   = ctx->global_ctx->vendor;
+    shader_lib_ctx.arch                     = ctx->global_ctx->arch;
+    shader_lib_ctx.device                   = ctx->global_ctx->device_name;
+    shader_lib_ctx.model                    = ctx->global_ctx->model_id;
 
     // Get or create pipeline
     webgpu_pipeline                   pipeline;
@@ -1583,6 +1591,10 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id_vec(webgpu_context & ctx,
     shader_lib_ctx.dst                            = dst;
     shader_lib_ctx.supports_subgroups             = ctx->global_ctx->capabilities.supports_subgroups;
     shader_lib_ctx.max_wg_size = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
+    shader_lib_ctx.vendor = ctx->global_ctx->vendor;
+    shader_lib_ctx.arch   = ctx->global_ctx->arch;
+    shader_lib_ctx.device = ctx->global_ctx->device_name;
+    shader_lib_ctx.model  = ctx->global_ctx->model_id;
 
     webgpu_pipeline pipeline = ctx->shader_lib->get_mul_mat_id_vec_pipeline(shader_lib_ctx);
 
@@ -1642,6 +1654,10 @@ static webgpu_encoded_op ggml_webgpu_mul_mat_id(webgpu_context & ctx,
     shader_lib_ctx.src2                           = src2;
     shader_lib_ctx.dst                            = dst;
     shader_lib_ctx.max_wg_size = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
+    shader_lib_ctx.vendor = ctx->global_ctx->vendor;
+    shader_lib_ctx.arch   = ctx->global_ctx->arch;
+    shader_lib_ctx.device = ctx->global_ctx->device_name;
+    shader_lib_ctx.model  = ctx->global_ctx->model_id;
 
     // Get or create pipeline
     webgpu_pipeline gather_pipeline;
@@ -3235,6 +3251,13 @@ static ggml_status ggml_backend_webgpu_graph_compute(ggml_backend_t backend, str
     ggml_backend_webgpu_context * backend_ctx = (ggml_backend_webgpu_context *) backend->context;
     webgpu_context                ctx         = backend_ctx->webgpu_ctx;
 
+    if (ctx->global_ctx->model_id.empty()) {
+        ctx->global_ctx->model_id = ggml_webgpu_resolve_model_id(cgraph, ctx->global_ctx->vendor);
+        if (std::getenv("GGML_WEBGPU_TUNING_VERBOSE")) {
+            GGML_LOG_INFO("ggml_webgpu: tuning model_id = %s\n", ctx->global_ctx->model_id.c_str());
+        }
+    }
+
     WEBGPU_CPU_PROFILE_TOTAL_START(graph_compute);
 
     std::vector<webgpu_encoded_op> commands;
@@ -3831,6 +3854,8 @@ static void create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     ctx->webgpu_global_ctx->command_submit_batch_size = ggml_backend_webgpu_get_command_submit_batch_size();
     ctx->webgpu_global_ctx->max_inflight_batches      = ggml_backend_webgpu_get_max_inflight_batches();
     ctx->webgpu_global_ctx->vendor                    = info.vendor;
+    ctx->webgpu_global_ctx->arch                      = std::string(info.architecture);
+    ctx->webgpu_global_ctx->device_name               = std::string(info.device);
     ctx->webgpu_global_ctx->capabilities.supports_subgroups =
         ctx->webgpu_global_ctx->adapter.HasFeature(wgpu::FeatureName::Subgroups);
     // for dot4I8packed

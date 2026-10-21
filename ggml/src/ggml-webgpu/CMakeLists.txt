@@ -87,3 +87,18 @@ endif()
 
 target_include_directories(ggml-webgpu PRIVATE ${SHADER_OUTPUT_DIR})
 target_link_libraries(ggml-webgpu PRIVATE ${DawnWebGPU_TARGET})
+
+# Optional native compiler. The default build has no LLVM dependency.
+set(GGML_WEBGPU_MLIR_ROOT "" CACHE PATH "LLVM source tree containing the built WGSL compiler")
+if (GGML_WEBGPU_MLIR_ROOT)
+    if (EMSCRIPTEN OR WASI)
+        message(FATAL_ERROR "On-demand MLIR compilation currently requires a native build")
+    endif()
+    find_path(GGML_WEBGPU_MLIR_INCLUDE mlir/Target/WGSL/MatmulCompiler.h
+        PATHS "${GGML_WEBGPU_MLIR_ROOT}/mlir/include" NO_DEFAULT_PATH REQUIRED)
+    find_library(GGML_WEBGPU_MLIR_LIBRARY MLIRWGSLMatmulCompiler
+        PATHS "${GGML_WEBGPU_MLIR_ROOT}/build/lib" NO_DEFAULT_PATH REQUIRED)
+    target_compile_definitions(ggml-webgpu PRIVATE GGML_WEBGPU_MLIR=1)
+    target_include_directories(ggml-webgpu PRIVATE "${GGML_WEBGPU_MLIR_INCLUDE}")
+    target_link_libraries(ggml-webgpu PRIVATE "${GGML_WEBGPU_MLIR_LIBRARY}")
+endif()

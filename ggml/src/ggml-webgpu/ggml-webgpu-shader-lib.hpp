@@ -91,6 +91,10 @@ struct ggml_webgpu_shader_lib_context {
     size_t      wg_mem_limit_bytes       = 0;
     bool        supports_subgroups       = false;
     bool        supports_subgroup_matrix = false;
+    uint32_t    mlir_mma_shapes          = 0;
+    bool        mlir_aligned_storage     = false;
+    uint32_t    max_wg_size_x            = 0;
+    uint32_t    max_shared_memory_bytes  = 0;
     uint32_t    sg_mat_m                 = 0;
     uint32_t    sg_mat_n                 = 0;
     uint32_t    sg_mat_k                 = 0;

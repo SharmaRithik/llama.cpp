@@ -173,6 +173,7 @@ struct webgpu_capabilities {
     wgpu::Limits limits;
     bool         supports_subgroups       = false;
     bool         supports_subgroup_matrix = false;
+    uint32_t     mlir_mma_shapes          = 0;
     bool         supports_dot_product     = false;
 
     uint32_t sg_mat_m = 0;
@@ -1646,6 +1647,19 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
     shader_lib_ctx.max_wg_size              = ctx->global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup;
     shader_lib_ctx.supports_subgroups       = ctx->global_ctx->capabilities.supports_subgroups;
     shader_lib_ctx.supports_subgroup_matrix = ctx->global_ctx->capabilities.supports_subgroup_matrix;
+    shader_lib_ctx.mlir_mma_shapes           = ctx->global_ctx->capabilities.mlir_mma_shapes;
+    shader_lib_ctx.mlir_aligned_storage      = ggml_webgpu_tensor_misalignment(ctx, src0) % 8 == 0 &&
+                                              ggml_webgpu_tensor_misalignment(ctx, src1) % (4 * ggml_type_size(src1->type)) == 0 &&
+                                              ggml_webgpu_tensor_misalignment(ctx, dst) % 16 == 0;
+    for (int dim = 1; dim < 4; ++dim) {
+        shader_lib_ctx.mlir_aligned_storage &= src0->nb[dim] % (4 * ggml_type_size(src0->type)) == 0 &&
+                                               src1->nb[dim] % (4 * ggml_type_size(src1->type)) == 0;
+    }
+    if (getenv("GGML_WEBGPU_DISABLE_SUBGROUP_MATRIX") != nullptr) {
+        shader_lib_ctx.supports_subgroup_matrix = false;
+    }
+    shader_lib_ctx.max_wg_size_x             = ctx->global_ctx->capabilities.limits.maxComputeWorkgroupSizeX;
+    shader_lib_ctx.max_shared_memory_bytes   = ctx->global_ctx->capabilities.limits.maxComputeWorkgroupStorageSize;
     shader_lib_ctx.sg_mat_m                 = ctx->global_ctx->capabilities.sg_mat_m;
     shader_lib_ctx.sg_mat_n                 = ctx->global_ctx->capabilities.sg_mat_n;
     shader_lib_ctx.sg_mat_k                 = ctx->global_ctx->capabilities.sg_mat_k;
@@ -4203,13 +4217,20 @@ static void create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
     if (ctx->webgpu_global_ctx->adapter.HasFeature(wgpu::FeatureName::ChromiumExperimentalSubgroupMatrix)) {
         for (size_t i = 0; i < subgroup_matrix_configs.configCount; i++) {
             const wgpu::SubgroupMatrixConfig config = subgroup_matrix_configs.configs[i];
+#ifdef GGML_WEBGPU_MLIR
             if (config.componentType == wgpu::SubgroupMatrixComponentType::F16 &&
-                config.resultComponentType == wgpu::SubgroupMatrixComponentType::F16) {
+                config.M == 16 && (config.N == 16 || config.N == 8) && config.K == 16) {
+                uint32_t bit = config.resultComponentType == wgpu::SubgroupMatrixComponentType::F16 ? 1u :
+                               config.resultComponentType == wgpu::SubgroupMatrixComponentType::F32 ? 2u : 0u;
+                ctx->webgpu_global_ctx->capabilities.mlir_mma_shapes |= config.N == 16 ? bit : bit << 2;
+            }
+#endif
+            if (config.componentType == wgpu::SubgroupMatrixComponentType::F16 &&
+                config.resultComponentType == wgpu::SubgroupMatrixComponentType::F16 && !valid_subgroup_matrix_config) {
                 ctx->webgpu_global_ctx->capabilities.sg_mat_m = config.M;
                 ctx->webgpu_global_ctx->capabilities.sg_mat_n = config.N;
                 ctx->webgpu_global_ctx->capabilities.sg_mat_k = config.K;
                 valid_subgroup_matrix_config                  = true;
-                break;
             }
         }
     }
@@ -4225,7 +4246,7 @@ static void create_webgpu_device(ggml_backend_webgpu_reg_context * ctx) {
 
 #if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
     required_features.push_back(wgpu::FeatureName::ImplicitDeviceSynchronization);
-    if (ctx->webgpu_global_ctx->capabilities.supports_subgroup_matrix) {
+    if (ctx->webgpu_global_ctx->capabilities.supports_subgroup_matrix || ctx->webgpu_global_ctx->capabilities.mlir_mma_shapes) {
         required_features.push_back(wgpu::FeatureName::ChromiumExperimentalSubgroupMatrix);
     }
 #endif

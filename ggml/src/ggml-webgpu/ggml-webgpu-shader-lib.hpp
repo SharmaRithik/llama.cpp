@@ -2017,6 +2017,25 @@ class ggml_webgpu_shader_lib {
     }
 
     webgpu_pipeline get_mul_mat_vec_pipeline(const ggml_webgpu_shader_lib_context & context, bool src_overlap) {
+#ifdef GGML_WEBGPU_MLIR
+        const char * gemv = getenv("GGML_WEBGPU_MLIR_GEMV");
+        if (gemv && strcmp(gemv, "0") != 0 && strcmp(gemv, "1") != 0) {
+            GGML_ABORT("GGML_WEBGPU_MLIR_GEMV must be 0 or 1");
+        }
+        if (gemv && strcmp(gemv, "1") == 0 && context.src0->type == GGML_TYPE_F16 &&
+            (context.src1->type == GGML_TYPE_F16 || context.src1->type == GGML_TYPE_F32)) {
+            if (!context.supports_subgroups || context.min_subgroup_size != context.max_subgroup_size) {
+                GGML_ABORT("MLIR GEMV requires a fixed subgroup size");
+            }
+            if ((src_overlap && context.src1->type != GGML_TYPE_F16) ||
+                context.src0->nb[0] != ggml_type_size(context.src0->type) ||
+                context.src1->nb[0] != ggml_type_size(context.src1->type) ||
+                !ggml_is_contiguous(context.dst)) {
+                GGML_ABORT("MLIR GEMV requires contiguous inner dimensions, contiguous output, and compatible bindings");
+            }
+            return get_mlir_mul_mat_pipeline(context, false, src_overlap, true);
+        }
+#endif
         ggml_webgpu_mul_mat_vec_pipeline_key key = {};
         key.src0_type                            = context.src0->type;
         key.src1_type                            = context.src1->type;

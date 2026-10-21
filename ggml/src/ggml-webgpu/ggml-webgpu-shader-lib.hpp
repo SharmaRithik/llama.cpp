@@ -1056,6 +1056,8 @@ struct ggml_webgpu_mul_mat_shader_decisions {
     uint32_t subgroup_matrix_n;
 
     uint32_t mul_mat_wg_size;
+    uint32_t compiled_tile_m = 0;
+    uint32_t compiled_tile_n = 0;
     bool     src_overlap = false;
 };
 
@@ -2178,7 +2180,92 @@ class ggml_webgpu_shader_lib {
         return mul_mat_vec_pipelines[key];
     }
 
+#ifdef GGML_WEBGPU_MLIR
+    std::unordered_map<std::string, webgpu_pipeline> mlir_mul_mat_pipelines;
+
+    webgpu_pipeline get_mlir_mul_mat_pipeline(const ggml_webgpu_shader_lib_context & context, bool mma, bool src_overlap, bool gemv = false) {
+        const int64_t m = context.dst->ne[0];
+        const int64_t n = context.dst->ne[1];
+        const int64_t k = context.src0->ne[0];
+        const bool rhs_f16 = context.src1->type == GGML_TYPE_F16;
+        const char * precision = getenv("GGML_WEBGPU_MLIR_ACC");
+        const bool requires_f32 = ggml_get_op_params_i32(context.dst, 0) == GGML_PREC_F32;
+        const bool acc_f16 = !gemv && !requires_f32 && (precision ? strcmp(precision, "f16") == 0 : mma);
+        if (precision && strcmp(precision, "f16") != 0 && strcmp(precision, "f32") != 0) {
+            GGML_ABORT("GGML_WEBGPU_MLIR_ACC must be f16 or f32");
+        }
+        const char * level_text = getenv("GGML_WEBGPU_MLIR_OPT_LEVEL");
+        if (level_text && (strlen(level_text) != 1 || level_text[0] < '0' || level_text[0] > '2')) {
+            GGML_ABORT("GGML_WEBGPU_MLIR_OPT_LEVEL must be 0, 1 or 2");
+        }
+        const uint32_t level = level_text ? (uint32_t) (level_text[0] - '0') : 2;
+        const std::string name = std::string("mlir_jit_") + (gemv ? "gemv_" : mma ? "mma_" : "regtile_") +
+            (rhs_f16 ? "f16_" : "f32_") + std::to_string(m) + "_" + std::to_string(n) + "_" + std::to_string(k) +
+            (acc_f16 ? "_acc16" : "_acc32") + "_O" + std::to_string(level) +
+            (context.mlir_aligned_storage ? "_aligned" : "_scalar") +
+            "_batch" + std::to_string(context.dst->ne[2] * context.dst->ne[3]) +
+            (src_overlap ? "_merged" : "");
+        auto it = mlir_mul_mat_pipelines.find(name);
+        if (it != mlir_mul_mat_pipelines.end()) {
+            return it->second;
+        }
+        const std::string input = ggml_webgpu_mlir_matmul_source(m, n, k, rhs_f16, acc_f16, gemv);
+        MlirWgslMatmulOptions options = { 2, (uint32_t) mma, context.max_subgroup_size,
+            std::min(context.max_wg_size, context.max_wg_size_x), context.max_shared_memory_bytes,
+            level, context.mlir_aligned_storage ? 4u : 1u, context.vendor == "nvidia" ? 1u : 0u,
+            context.mlir_mma_shapes, (uint32_t) (context.dst->ne[2] * context.dst->ne[3]), (uint32_t) src_overlap };
+        MlirWgslMatmulKernel compiled = {};
+        const int64_t start = ggml_time_us();
+        if (mlirWgslCompileMatmul(input.c_str(), &options, &compiled) != 0) {
+            const std::string error = compiled.error ? compiled.error : "unknown error";
+            mlirWgslFreeMatmulKernel(&compiled);
+            GGML_ABORT("MLIR compilation failed: %s", error.c_str());
+        }
+        GGML_LOG_INFO("WebGPU MLIR compiled %s in %.2f ms (tile %ux%u, %u threads, %u shared bytes)\n",
+            name.c_str(), (ggml_time_us() - start) / 1000.0, compiled.tile_m, compiled.tile_n,
+            compiled.workgroup_size, compiled.shared_memory_bytes);
+        ggml_webgpu_mlir_dump(name, input, compiled);
+        webgpu_pipeline pipeline = ggml_webgpu_create_pipeline(device, compiled.wgsl, name);
+        if (gemv) {
+            auto decisions = std::make_shared<ggml_webgpu_mul_mat_vec_shader_decisions>();
+            decisions->outputs_per_wg = compiled.tile_m;
+            decisions->wg_size = compiled.workgroup_size;
+            decisions->vec_size = 1;
+            pipeline.context = decisions;
+        } else {
+            auto decisions = std::make_shared<ggml_webgpu_mul_mat_shader_decisions>();
+            decisions->compiled_tile_m = compiled.tile_m;
+            decisions->compiled_tile_n = compiled.tile_n;
+            decisions->wg_size = compiled.workgroup_size;
+            pipeline.context = decisions;
+        }
+        mlirWgslFreeMatmulKernel(&compiled);
+        mlir_mul_mat_pipelines.emplace(name, pipeline);
+        return pipeline;
+    }
+#endif
+
     webgpu_pipeline get_mul_mat_fast_pipeline(const ggml_webgpu_shader_lib_context & context, bool src_overlap) {
+#ifdef GGML_WEBGPU_MLIR
+        const char * mode = getenv("GGML_WEBGPU_MLIR");
+        if (mode != nullptr && context.src0->type == GGML_TYPE_F16 &&
+            (context.src1->type == GGML_TYPE_F16 || context.src1->type == GGML_TYPE_F32)) {
+            const bool mma = strcmp(mode, "mma") == 0;
+            if (!mma && strcmp(mode, "regtile") != 0) {
+                GGML_ABORT("GGML_WEBGPU_MLIR must be mma or regtile");
+            }
+            if ((src_overlap && context.src1->type != GGML_TYPE_F16) ||
+                context.src0->nb[0] != ggml_type_size(context.src0->type) ||
+                context.src1->nb[0] != ggml_type_size(context.src1->type) ||
+                !ggml_is_contiguous(context.dst)) {
+                GGML_ABORT("MLIR matmul requires contiguous inner dimensions, contiguous output, and compatible bindings");
+            }
+            if (mma && (!context.mlir_mma_shapes || context.min_subgroup_size != 32 || context.max_subgroup_size != 32)) {
+                GGML_ABORT("MLIR MMA requires 32-lane subgroups and f16/f32 16x16x16 matrix support");
+            }
+            return get_mlir_mul_mat_pipeline(context, mma, src_overlap);
+        }
+#endif
         ggml_webgpu_mul_mat_pipeline_key key = {};
         key.src0_type                        = context.src0->type;
         key.src1_type                        = context.src1->type;

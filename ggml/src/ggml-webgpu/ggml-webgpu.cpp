@@ -1749,7 +1749,10 @@ static webgpu_encoded_op ggml_webgpu_mul_mat(webgpu_context & ctx,
         // Fast-path tiled/subgroup calculations
         uint32_t wg_m;
         uint32_t wg_n;
-        if (decisions->use_subgroup_matrix) {
+        if (decisions->compiled_tile_m != 0) {
+            wg_m = CEIL_DIV(dst->ne[0], decisions->compiled_tile_m);
+            wg_n = CEIL_DIV(dst->ne[1], decisions->compiled_tile_n);
+        } else if (decisions->use_subgroup_matrix) {
             uint32_t wg_m_sg_tile =
                 decisions->subgroup_m * decisions->subgroup_matrix_m * ctx->global_ctx->capabilities.sg_mat_m;
             wg_m = CEIL_DIV(dst->ne[0], wg_m_sg_tile);

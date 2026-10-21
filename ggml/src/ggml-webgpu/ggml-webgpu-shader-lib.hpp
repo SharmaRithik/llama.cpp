@@ -3651,6 +3651,21 @@ class ggml_webgpu_shader_lib {
     static webgpu_pipeline ggml_webgpu_create_pipeline(wgpu::Device & device,
                                                        std::string    shader_code,
                                                        std::string    label) {
+#ifdef GGML_WEBGPU_MLIR
+        if (const char * directory = getenv("GGML_WEBGPU_SHADER_DUMP_DIR")) {
+            std::error_code error;
+            std::filesystem::create_directories(directory, error);
+            if (error) {
+                GGML_ABORT("Cannot create shader dump directory: %s", error.message().c_str());
+            }
+            std::ofstream file(std::filesystem::path(directory) / (label + ".wgsl"));
+            file << shader_code;
+            file.close();
+            if (!file) {
+                GGML_ABORT("Cannot write shader dump for %s", label.c_str());
+            }
+        }
+#endif
         wgpu::ShaderSourceWGSL shader_source;
         shader_source.code = shader_code.c_str();
 

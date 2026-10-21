@@ -6,6 +6,10 @@
 #include "ggml.h"
 #include "pre_wgsl.hpp"
 
+#ifdef GGML_WEBGPU_MLIR
+#include "ggml-webgpu-mlir.hpp"
+#endif
+
 #include <webgpu/webgpu_cpp.h>
 
 #include <algorithm>
